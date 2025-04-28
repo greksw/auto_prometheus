@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # --- Конфигурация ---
-GRAFANA_DOMAIN="$(hostname -f)"  # Или явно укажите домен (например, monitoring.example.com)
-PROMETHEUS_PASSWORD="$(openssl rand -hex 16)"  # Автогенерация пароля
+GRAFANA_DOMAIN="$(hostname -f)"  # Или явно укажите домен
+PROMETHEUS_PASSWORD="$(openssl rand -hex 16)"
 EXPORTER_PASSWORD="$(openssl rand -hex 16)"
 FAIL2BAN_BANTIME="1h"
 FAIL2BAN_MAXRETRY="3"
@@ -14,39 +14,51 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# --- Установка зависимостей ---
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get upgrade -y
-apt-get install -y wget curl ufw fail2ban openssl apache2-utils python3
+# --- Логирование ---
+LOG_FILE="/var/log/monitoring_setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "📅 Начало установки: $(date)"
 
-# --- Настройка firewall (исправленная версия) ---
+# --- Установка зависимостей ---
+echo "🔄 Установка необходимых пакетов..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -yq \
+    wget curl ufw fail2ban openssl apache2-utils \
+    python3 software-properties-common gnupg
+
+# --- Настройка firewall ---
+echo "🔥 Настройка firewall..."
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow ssh
 ufw allow 443/tcp   # Grafana HTTPS
 ufw allow 9090/tcp  # Prometheus HTTPS
-echo "y" | ufw enable  # Автоподтверждение
-echo "✅ Firewall настроен (разрешены SSH, 443, 9090)"
+echo "y" | ufw enable
+ufw status verbose
 
-# --- Генерация ECDSA сертификатов (P-384) ---
+# --- Генерация ECDSA сертификатов ---
+echo "🔐 Генерация SSL сертификатов..."
 mkdir -p /etc/ssl/private
-openssl ecparam -genkey -name secp384r1 -out /etc/ssl/private/monitoring.key
+if ! openssl ecparam -genkey -name secp384r1 -out /etc/ssl/private/monitoring.key; then
+    echo "⚠️ Не удалось сгенерировать ECDSA ключ, используем RSA 2048 как запасной вариант"
+    openssl genrsa -out /etc/ssl/private/monitoring.key 2048
+fi
 openssl req -new -x509 -sha384 -days 365 -key /etc/ssl/private/monitoring.key \
     -out /etc/ssl/private/monitoring.crt \
     -subj "/CN=$GRAFANA_DOMAIN/O=Secure Monitoring/OU=DevOps"
 chmod 600 /etc/ssl/private/monitoring.*
-echo "✅ Сгенерирован ECDSA P-384 SSL-сертификат"
 
-### --- Установка и настройка Prometheus ---
-useradd --system --no-create-home --shell /bin/false prometheus
-wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
-tar xvf prometheus-*.tar.gz -C /opt/
+# --- Установка Prometheus ---
+echo "📊 Установка Prometheus..."
+useradd --system --no-create-home --shell /bin/false prometheus || true
+wget -q https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+tar xf prometheus-*.tar.gz -C /opt/
 mv /opt/prometheus-* /opt/prometheus
 rm prometheus-*.tar.gz
 
-# Конфиг Prometheus с HTTPS и аутентификацией
+# Конфигурация Prometheus
 cat > /opt/prometheus/prometheus.yml <<EOF
 global:
   scrape_interval: 15s
@@ -60,18 +72,15 @@ scrape_configs:
       password: '$EXPORTER_PASSWORD'
 EOF
 
-# Web-конфиг с HTTPS
-cat > /opt/prometheus/web.yml <<EOF
-tls_server_config:
-  cert_file: /etc/ssl/private/monitoring.crt
-  key_file: /etc/ssl/private/monitoring.key
-basic_auth_users:
-  admin: $(echo "$PROMETHEUS_PASSWORD" | htpasswd -n -i admin | cut -d: -f2)
-EOF
+# Настройка аутентификации
+htpasswd -b -c /opt/prometheus/web.yml admin "$PROMETHEUS_PASSWORD" || {
+    apt-get install -yq apache2-utils
+    htpasswd -b -c /opt/prometheus/web.yml admin "$PROMETHEUS_PASSWORD"
+}
 
 chown -R prometheus:prometheus /opt/prometheus
 
-# Systemd unit для Prometheus
+# Systemd service
 cat > /etc/systemd/system/prometheus.service <<EOF
 [Unit]
 Description=Prometheus
@@ -81,10 +90,10 @@ After=network-online.target
 [Service]
 User=prometheus
 Group=prometheus
-ExecStart=/opt/prometheus/prometheus \
-    --config.file=/opt/prometheus/prometheus.yml \
-    --web.config.file=/opt/prometheus/web.yml \
-    --web.listen-address=:9090 \
+ExecStart=/opt/prometheus/prometheus \\
+    --config.file=/opt/prometheus/prometheus.yml \\
+    --web.config.file=/opt/prometheus/web.yml \\
+    --web.listen-address=:9090 \\
     --web.external-url=https://$GRAFANA_DOMAIN:9090
 Restart=always
 
@@ -94,16 +103,17 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now prometheus
-echo "✅ Prometheus установлен (HTTPS + Basic Auth)"
+systemctl status prometheus --no-pager
 
-### --- Установка и настройка Grafana ---
-apt-get install -y apt-transport-https software-properties-common
-wget -q -O - https://packages.grafana.com/gpg.key | gpg --dearmor | tee /usr/share/keyrings/grafana.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://packages.grafana.com/oss/deb stable main" | tee /etc/apt/sources.list.d/grafana.list
-apt-get update
-apt-get install -y grafana
+# --- Установка Grafana ---
+echo "📈 Установка Grafana..."
+apt-get install -yq apt-transport-https
+wget -q -O - https://packages.grafana.com/gpg.key | gpg --dearmor > /usr/share/keyrings/grafana.gpg
+echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://packages.grafana.com/oss/deb stable main" > /etc/apt/sources.list.d/grafana.list
+apt-get update -q
+apt-get install -yq grafana
 
-# Конфиг Grafana с HTTPS
+# Конфигурация Grafana
 cat > /etc/grafana/grafana.ini <<EOF
 [server]
 protocol = https
@@ -121,21 +131,22 @@ admin_password = $(openssl rand -hex 12)
 EOF
 
 systemctl enable --now grafana-server
-echo "✅ Grafana установлен (HTTPS + ECDSA P-384)"
+systemctl status grafana-server --no-pager
 
-### --- Установка Node Exporter ---
-useradd --system --no-create-home --shell /bin/false node_exporter
-wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
-tar xvf node_exporter-*.tar.gz
+# --- Установка Node Exporter ---
+echo "🖥️ Установка Node Exporter..."
+useradd --system --no-create-home --shell /bin/false node_exporter || true
+wget -q https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+tar xf node_exporter-*.tar.gz
 mv node_exporter-*/node_exporter /usr/local/bin/
 rm -rf node_exporter-*
 
-# Аутентификация для экспортера
+# Настройка аутентификации
 mkdir -p /etc/node_exporter
 htpasswd -b -c /etc/node_exporter/web.yml exporter "$EXPORTER_PASSWORD"
 chown node_exporter:node_exporter /etc/node_exporter/web.yml
 
-# Systemd unit для Node Exporter
+# Systemd service
 cat > /etc/systemd/system/node_exporter.service <<EOF
 [Unit]
 Description=Node Exporter
@@ -144,7 +155,7 @@ After=network.target
 [Service]
 User=node_exporter
 Group=node_exporter
-ExecStart=/usr/local/bin/node_exporter \
+ExecStart=/usr/local/bin/node_exporter \\
     --web.config.file=/etc/node_exporter/web.yml
 
 [Install]
@@ -152,9 +163,10 @@ WantedBy=multi-user.target
 EOF
 
 systemctl enable --now node_exporter
-echo "✅ Node Exporter установлен (Basic Auth)"
+systemctl status node_exporter --no-pager
 
-### --- Настройка Fail2Ban ---
+# --- Настройка Fail2Ban ---
+echo "🛡️ Настройка Fail2Ban..."
 cat > /etc/fail2ban/jail.d/monitoring.conf <<EOF
 [grafana]
 enabled = true
@@ -168,12 +180,11 @@ bantime = $FAIL2BAN_BANTIME
 enabled = true
 port = 9090
 filter = prometheus
-logpath = /var/log/prometheus.log
+logpath = /var/log/syslog
 maxretry = $FAIL2BAN_MAXRETRY
 bantime = $FAIL2BAN_BANTIME
 EOF
 
-# Фильтры для Fail2Ban
 cat > /etc/fail2ban/filter.d/grafana.conf <<EOF
 [Definition]
 failregex = ^.*Failed.* user=<HOST>.*
@@ -187,29 +198,29 @@ ignoreregex =
 EOF
 
 systemctl restart fail2ban
-echo "✅ Fail2Ban настроен для Grafana и Prometheus"
+systemctl status fail2ban --no-pager
 
-# --- Исправление предупреждений Python в Fail2Ban ---
-sed -i 's/\\s/\\\\s/g; s/\\S/\\\\S/g; s/\\d/\\\\d/g; s/\\[/\\\\[/g' \
-    /usr/lib/python3/dist-packages/fail2ban/tests/*.py 2>/dev/null || true
-echo "⚠️ Исправлены предупреждения Python в Fail2Ban (если присутствовали)"
+# --- Фикс предупреждений Python ---
+echo "🐍 Исправление предупреждений Python..."
+find /usr/lib/python3/dist-packages/fail2ban -type f -name "*.py" -exec \
+    sed -i 's/\\s/\\\\s/g; s/\\S/\\\\S/g; s/\\d/\\\\d/g; s/\\[/\\\\[/g' {} + 2>/dev/null || true
 
 # --- Итоговая информация ---
 echo "
-=== Установка завершена! ===
-• Prometheus:  https://$GRAFANA_DOMAIN:9090
+🎉 Установка завершена!
+
+🔗 Доступ к сервисам:
+- Prometheus:  https://$GRAFANA_DOMAIN:9090
   Логин: admin
   Пароль: $PROMETHEUS_PASSWORD
 
-• Grafana:     https://$GRAFANA_DOMAIN:3000
+- Grafana:     https://$GRAFANA_DOMAIN:3000
   Логин: admin
   Пароль: $(grep 'admin_password' /etc/grafana/grafana.ini | cut -d' ' -f3)
 
-• Node Exporter: http://$(hostname -I | awk '{print $1}'):9100/metrics
+- Node Exporter: http://$(hostname -I | awk '{print $1}'):9100/metrics
   Логин: exporter
   Пароль: $EXPORTER_PASSWORD
 
-• Firewall (UFW) и Fail2Ban активны.
-• Все соединения защищены ECDSA P-384.
-• Для проверки: sudo systemctl status prometheus grafana-server fail2ban
+📋 Лог установки сохранен в: $LOG_FILE
 "
