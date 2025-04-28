@@ -15,18 +15,19 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- Установка зависимостей ---
+export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get upgrade -y
-apt-get install -y wget curl ufw fail2ban openssl apache2-utils
+apt-get install -y wget curl ufw fail2ban openssl apache2-utils python3
 
-# --- Настройка firewall ---
-ufw reset --force
+# --- Настройка firewall (исправленная версия) ---
+ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow ssh
 ufw allow 443/tcp   # Grafana HTTPS
 ufw allow 9090/tcp  # Prometheus HTTPS
-ufw --force enable
+echo "y" | ufw enable  # Автоподтверждение
 echo "✅ Firewall настроен (разрешены SSH, 443, 9090)"
 
 # --- Генерация ECDSA сертификатов (P-384) ---
@@ -38,7 +39,7 @@ openssl req -new -x509 -sha384 -days 365 -key /etc/ssl/private/monitoring.key \
 chmod 600 /etc/ssl/private/monitoring.*
 echo "✅ Сгенерирован ECDSA P-384 SSL-сертификат"
 
-# --- Установка Prometheus ---
+### --- Установка и настройка Prometheus ---
 useradd --system --no-create-home --shell /bin/false prometheus
 wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
 tar xvf prometheus-*.tar.gz -C /opt/
@@ -95,8 +96,8 @@ systemctl daemon-reload
 systemctl enable --now prometheus
 echo "✅ Prometheus установлен (HTTPS + Basic Auth)"
 
-# --- Установка Grafana ---
-apt-get install -y apt-transport-https
+### --- Установка и настройка Grafana ---
+apt-get install -y apt-transport-https software-properties-common
 wget -q -O - https://packages.grafana.com/gpg.key | gpg --dearmor | tee /usr/share/keyrings/grafana.gpg >/dev/null
 echo "deb [signed-by=/usr/share/keyrings/grafana.gpg] https://packages.grafana.com/oss/deb stable main" | tee /etc/apt/sources.list.d/grafana.list
 apt-get update
@@ -122,7 +123,7 @@ EOF
 systemctl enable --now grafana-server
 echo "✅ Grafana установлен (HTTPS + ECDSA P-384)"
 
-# --- Установка Node Exporter ---
+### --- Установка Node Exporter ---
 useradd --system --no-create-home --shell /bin/false node_exporter
 wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
 tar xvf node_exporter-*.tar.gz
@@ -153,7 +154,7 @@ EOF
 systemctl enable --now node_exporter
 echo "✅ Node Exporter установлен (Basic Auth)"
 
-# --- Настройка Fail2Ban ---
+### --- Настройка Fail2Ban ---
 cat > /etc/fail2ban/jail.d/monitoring.conf <<EOF
 [grafana]
 enabled = true
@@ -188,6 +189,11 @@ EOF
 systemctl restart fail2ban
 echo "✅ Fail2Ban настроен для Grafana и Prometheus"
 
+# --- Исправление предупреждений Python в Fail2Ban ---
+sed -i 's/\\s/\\\\s/g; s/\\S/\\\\S/g; s/\\d/\\\\d/g; s/\\[/\\\\[/g' \
+    /usr/lib/python3/dist-packages/fail2ban/tests/*.py 2>/dev/null || true
+echo "⚠️ Исправлены предупреждения Python в Fail2Ban (если присутствовали)"
+
 # --- Итоговая информация ---
 echo "
 === Установка завершена! ===
@@ -199,10 +205,11 @@ echo "
   Логин: admin
   Пароль: $(grep 'admin_password' /etc/grafana/grafana.ini | cut -d' ' -f3)
 
-• Node Exporter: http://<SERVER_IP>:9100/metrics
+• Node Exporter: http://$(hostname -I | awk '{print $1}'):9100/metrics
   Логин: exporter
   Пароль: $EXPORTER_PASSWORD
 
 • Firewall (UFW) и Fail2Ban активны.
 • Все соединения защищены ECDSA P-384.
+• Для проверки: sudo systemctl status prometheus grafana-server fail2ban
 "
